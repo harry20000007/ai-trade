@@ -1,0 +1,298 @@
+// @version=5
+strategy("Fib + FVG Wick Entry (LL→HH / HH→LL) v1",
+     overlay=true, commission_type=strategy.commission.percent, commission_value=0.01,
+     initial_capital=10000, pyramiding=0, calc_on_every_tick=true, calc_on_order_fills=true)
+
+// =========================
+// ====== USER INPUTS ======
+// =========================
+anchorTF   = input.timeframe("15", "Anchor TF (Fib leg)", options=["15", "30"])
+fvgTF      = input.timeframe("5",  "FVG Scan TF",        options=["1", "5", "15"])
+swingL     = input.int(2, "Swing left/right bars (L)", minval=1, maxval=10)
+riskPct    = input.float(1.0, "Risk per trade (%)", step=0.1, minval=1.0, maxval=3.0)
+partialsP  = input.float(70, "Partials at TP1 (%)", minval=1, maxval=99)
+useLimitAtFvgMid = input.bool(false, "Use limit at FVG midpoint (else market-on-close)")
+cooldownBars = input.int(10, "Cooldown bars after SL (entry TF)", minval=0, maxval=200)
+trailWithSwings = input.bool(true, "Runner trailing by swings (else ATR 14)")
+atrMult         = input.float(2.0, "ATR multiple (if ATR trail)", step=0.1)
+
+// ==============================
+// ====== HELPER FUNCTIONS ======
+// ==============================
+
+// Get last confirmed swing highs/lows on a TF
+f_lastPivotHigh(srcH, left, right) =>
+    p = ta.pivothigh(srcH, left, right)
+    nz(p)
+
+f_lastPivotLow(srcL, left, right) =>
+    p = ta.pivotlow(srcL, left, right)
+    nz(p)
+
+// Pull anchor TF series
+[H_a, L_a, C_a] = request.security(syminfo.tickerid, anchorTF, [high, low, close], barmerge.gaps_off, barmerge.lookahead_off)
+
+// Pivot series on anchor TF
+ph = request.security(syminfo.tickerid, anchorTF, ta.pivothigh(H_a, swingL, swingL), barmerge.gaps_off, barmerge.lookahead_off)
+pl = request.security(syminfo.tickerid, anchorTF, ta.pivotlow(L_a, swingL, swingL),   barmerge.gaps_off, barmerge.lookahead_off)
+
+// Track most recent confirmed HH/LL pair that forms a leg
+var float lastHH = na
+var float lastLL = na
+var int   lastStructBar = na
+// Update on confirmations
+newHH = not na(ph)
+newLL = not na(pl)
+if newHH
+    lastHH := ph
+    lastStructBar := bar_index
+if newLL
+    lastLL := pl
+    lastStructBar := bar_index
+
+// Determine active leg (bullish if LL precedes HH; bearish if HH precedes LL)
+// For robustness: compute leg endpoints directly by last non-na pivots and compare their barssince
+barsSinceHH = barssince(not na(ph))
+barsSinceLL = barssince(not na(pl))
+bullishLeg  = (not na(lastLL) and not na(lastHH)) and (barsSinceLL > barsSinceHH)  // LL older than HH
+bearishLeg  = (not na(lastLL) and not na(lastHH)) and (barsSinceHH > barsSinceLL)  // HH older than LL
+
+// Compute Fib levels for the active leg
+float fib0   = na
+float fib1   = na
+float fib50  = na
+float fib618 = na
+
+if bullishLeg
+    fib0   := lastLL
+    fib1   := lastHH
+    range  = fib1 - fib0
+    fib50  := fib1 - range * 0.5
+    fib618 := fib1 - range * 0.618
+else if bearishLeg
+    fib0   := lastHH
+    fib1   := lastLL
+    range  = fib0 - fib1
+    fib50  := fib1 + range * 0.5
+    fib618 := fib1 + range * 0.618
+
+// Normalise 0.5–0.618 zone bounds
+float zLow  = na
+float zHigh = na
+if bullishLeg
+    zLow  := math.min(fib50, fib618)
+    zHigh := math.max(fib50, fib618)
+else if bearishLeg
+    zLow  := math.min(fib50, fib618)
+    zHigh := math.max(fib50, fib618)
+
+// ---------------------------------
+// FVG detection on chosen FVG TF
+// ---------------------------------
+[fH, fL] = request.security(syminfo.tickerid, fvgTF, [high, low], barmerge.gaps_off, barmerge.lookahead_off)
+
+// 3-candle imbalance conditions on FVG TF
+bullFVG_now = request.security(syminfo.tickerid, fvgTF, fL[1] > fH[3] ? 1 : 0)  // shift to align with current bar
+bearFVG_now = request.security(syminfo.tickerid, fvgTF, fH[1] < fL[3] ? 1 : 0)
+
+// Helper to search recent FVG that overlaps fib zone
+lookback = 200
+var float fvgTopBull  = na
+var float fvgBotBull  = na
+var float fvgTopBear  = na
+var float fvgBotBear  = na
+
+// On each bar, scan the last N FVGs on the FVG TF and pick the most recent overlapping the zone
+findBullFvgOverlap() =>
+    float top = na
+    float bot = na
+    // We approximate: check historical FVG pattern using security() with history references
+    // For k from 0..lookback, when bullFVG at k, gap = (high[k+2], low[k]) in FVG TF terms
+    // Because of TF mixing, we use request.security() arrays not available; emulate by checking current state only + persistence.
+    // Pragmatic approach: when a new bull FVG appears, record its bounds and carry forward until filled.
+    if bullFVG_now == 1
+        // Gap bounds per definition: (high[0], low[2]) on FVG TF; re-evaluated via request.security just above
+        // Approximate with present fH and fL series:
+        top := fH[0]
+        bot := fL[2]
+    [top, bot]
+
+findBearFvgOverlap() =>
+    float top = na
+    float bot = na
+    if bearFVG_now == 1
+        // Gap bounds: (low[0], high[2]) for bearish
+        bot := fL[0]
+        top := fH[2]
+    [top, bot]
+
+// Update latest FVGs when they form
+[topB, botB] = findBullFvgOverlap()
+if not na(topB) and not na(botB)
+    fvgTopBull := topB
+    fvgBotBull := botB
+
+[topS, botS] = findBearFvgOverlap()
+if not na(topS) and not na(botS)
+    fvgTopBear := topS
+    fvgBotBear := botS
+
+// Check overlap of FVG with fib zone (any intersection)
+overlaps(rangeLow, rangeHigh, aLow, aHigh) =>
+    not (aHigh < rangeLow or aLow > rangeHigh)
+
+bullFvgOverlaps = not na(fvgTopBull) and not na(zLow) and overlaps(zLow, zHigh, fvgBotBull, fvgTopBull)
+bearFvgOverlaps = not na(fvgTopBear) and not na(zLow) and overlaps(zLow, zHigh, fvgBotBear, fvgTopBear)
+
+// Wick-into-FVG (on chart TF)
+wickIntoBull = bullFvgOverlaps and low <= fvgTopBull and low >= fvgBotBull
+wickIntoBear = bearFvgOverlaps and high >= fvgBotBear and high <= fvgTopBear
+
+// ==============================
+// ===== STOP / TARGET LOGIC ====
+// ==============================
+// Recent swings on entry TF
+ph_e = ta.pivothigh(high, swingL, swingL)
+pl_e = ta.pivotlow(low,  swingL, swingL)
+
+float recentSwingHigh = ta.valuewhen(not na(ph_e), ph_e, 0)
+float recentSwingLow  = ta.valuewhen(not na(pl_e), pl_e, 0)
+
+// SL per rules
+longSL  = math.min(nz(recentSwingLow, low[1]), nz(lastLL, low[1]))
+shortSL = math.max(nz(recentSwingHigh, high[1]), nz(lastHH, high[1]))
+
+// TP1 per rules
+longTP1  = nz(lastHH, high)
+shortTP1 = nz(lastLL, low)
+
+// Position sizing by risk %
+riskCash(rpct) =>
+    strategy.equity * (rpct / 100.0)
+
+qtyFor(entryPrice, stopPrice, rpct) =>
+    risk = riskCash(rpct)
+    riskPerUnit = math.abs(entryPrice - stopPrice)
+    riskPerUnit > 0 ? risk / riskPerUnit : 0.0
+
+// ==============================
+// ======= ENTRY TRIGGERS =======
+// ==============================
+var int cooldownCount = 0
+cooldownActive = cooldownCount > 0
+if cooldownActive
+    cooldownCount -= 1
+
+canLong = bullishLeg and bullFvgOverlaps and wickIntoBull and not cooldownActive and strategy.position_size == 0
+canShort = bearishLeg and bearFvgOverlaps and wickIntoBear and not cooldownActive and strategy.position_size == 0
+
+// Entry prices
+longEntry  = useLimitAtFvgMid ? (fvgTopBull + fvgBotBull) / 2.0 : close
+shortEntry = useLimitAtFvgMid ? (fvgTopBear + fvgBotBear) / 2.0 : close
+
+// Quantities
+longQty  = qtyFor(longEntry, longSL, riskPct)
+shortQty = qtyFor(shortEntry, shortSL, riskPct)
+
+// Execute entries
+if canLong and longEntry > longSL
+    strategy.entry("LONG", strategy.long, qty=longQty, limit=useLimitAtFvgMid ? longEntry : na)
+if canShort and shortEntry < shortSL
+    strategy.entry("SHORT", strategy.short, qty=shortQty, limit=useLimitAtFvgMid ? shortEntry : na)
+
+// ==============================
+// ==== PARTIALS & RUNNER SL ====
+// ==============================
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avgPx   = strategy.position_avg_price
+
+// Flags to move stop to BE after TP1 touch
+var bool longTP1Hit  = false
+var bool shortTP1Hit = false
+
+// TP1 hit detection
+longTP1Hit  := inLong  and not longTP1Hit  and high >= longTP1
+shortTP1Hit := inShort and not shortTP1Hit and low  <= shortTP1
+
+// Create exits:
+// 1) TP1 partial limit + SL
+if inLong
+    // Partial 70% at TP1
+    strategy.exit("L-TP1",  from_entry="LONG", qty_percent=partialsP, limit=longTP1, stop=longSL)
+    // Runner 30% with SL that jumps to BE after TP1
+    runnerStopLong = longTP1Hit ? avgPx : longSL
+    // Optional trailing
+    if trailWithSwings
+        // trail to most recent pivot low if above current stop
+        trail = nz(recentSwingLow, runnerStopLong)
+        runnerStopLong := math.max(runnerStopLong, trail)
+    else
+        trail = ta.atr(14) * atrMult
+        runnerStopLong := math.max(runnerStopLong, close - trail)
+    strategy.exit("L-Runner", from_entry="LONG", qty_percent=100 - partialsP, stop=runnerStopLong)
+
+if inShort
+    strategy.exit("S-TP1",  from_entry="SHORT", qty_percent=partialsP, limit=shortTP1, stop=shortSL)
+    runnerStopShort = shortTP1Hit ? avgPx : shortSL
+    if trailWithSwings
+        trailS = nz(recentSwingHigh, runnerStopShort)
+        runnerStopShort := math.min(runnerStopShort, trailS)
+    else
+        trailS = ta.atr(14) * atrMult
+        runnerStopShort := math.min(runnerStopShort, close + trailS)
+    strategy.exit("S-Runner", from_entry="SHORT", qty_percent=100 - partialsP, stop=runnerStopShort)
+
+// Cooldown after full stop-out (detect by position flat & last exit was stop)
+// Approximate: if position just closed and bar low < SL (long) or bar high > SL (short)
+justFlat = strategy.position_size == 0 and strategy.closedtrades > 0 and strategy.closedtrades.entry_bar_index(strategy.closedtrades - 1) == bar_index - 1
+if justFlat
+    cooldownCount := cooldownBars
+
+// ==============================
+// =========== PLOTS ============
+// ==============================
+plot(bullishLeg ? lastLL : na, "LL (Anchor)", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+plot(bullishLeg ? lastHH : na, "HH (Anchor)", color=color.new(color.green, 0), style=plot.style_circles, linewidth=2)
+plot(bearishLeg ? lastHH : na, "HH (Anchor)", color=color.new(color.red, 0),   style=plot.style_circles, linewidth=2)
+plot(bearishLeg ? lastLL : na, "LL (Anchor)", color=color.new(color.red, 0),   style=plot.style_circles, linewidth=2)
+
+bgcolor(bullFvgOverlaps ? color.new(color.green, 90) : na, title="Bull FVG Overlap")
+bgcolor(bearFvgOverlaps ? color.new(color.red,   90) : na, title="Bear FVG Overlap")
+
+// Fib zone bands
+plot(zLow,  "Fib 0.5/0.618 low",  color=color.new(color.yellow, 0))
+plot(zHigh, "Fib 0.5/0.618 high", color=color.new(color.orange, 0))
+
+// FVG boxes
+var box bullBox = na
+var box bearBox = na
+if bullFvgOverlaps
+    if na(bullBox)
+        bullBox := box.new(left=bar_index-1, top=fvgTopBull, right=bar_index, bottom=fvgBotBull, bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 0))
+    else
+        box.set_right(bullBox, bar_index)
+        box.set_top(bullBox,  fvgTopBull)
+        box.set_bottom(bullBox, fvgBotBull)
+else
+    if bullBox
+        box.delete(bullBox)
+        bullBox := na
+
+if bearFvgOverlaps
+    if na(bearBox)
+        bearBox := box.new(left=bar_index-1, top=fvgTopBear, right=bar_index, bottom=fvgBotBear, bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 0))
+    else
+        box.set_right(bearBox, bar_index)
+        box.set_top(bearBox,  fvgTopBear)
+        box.set_bottom(bearBox, fvgBotBear)
+else
+    if bearBox
+        box.delete(bearBox)
+        bearBox := na
+
+// Alert messages
+longMsg  = "LONG: Wick tapped Bullish FVG within Fib 0.5–0.618 | Entry=" + str.tostring(longEntry) + " SL=" + str.tostring(longSL) + " TP1=" + str.tostring(longTP1) + " Risk=" + str.tostring(riskPct) + "%"
+shortMsg = "SHORT: Wick tapped Bearish FVG within Fib 0.5–0.618 | Entry=" + str.tostring(shortEntry) + " SL=" + str.tostring(shortSL) + " TP1=" + str.tostring(shortTP1) + " Risk=" + str.tostring(riskPct) + "%"
+alertcondition(canLong,  title="Long Signal",  message=longMsg)
+alertcondition(canShort, title="Short Signal", message=shortMsg)
